@@ -1,12 +1,15 @@
 import streamlit as st
 from streamlit_mic_recorder import mic_recorder
 from pydub import AudioSegment
+from camera_detector import analyze_face_image
 import pandas as pd
 import numpy as np
 import datetime
 import os
 import io
 import sys
+import streamlit as st
+st.set_page_config(page_title="NeuroCare Lite: Mental Wellness Screener", layout="wide", initial_sidebar_state="expanded")
 import multiprocessing
 
 # ============================================================
@@ -56,11 +59,7 @@ def main():
     # --------------------------------------------------------
     # Streamlit UI Configuration
     # --------------------------------------------------------
-    st.set_page_config(
-        page_title="NeuroCare Lite: Mental Wellness Screener",
-        layout="wide",
-        initial_sidebar_state="expanded"
-    )
+    
 
     # --------------------------------------------------------
     # Session State Initialization
@@ -221,6 +220,7 @@ def main():
 
         # Calculate Overall Risk
         total_risk = calculate_total_risk(text_result, voice_result, text_present, voice_present)
+        st.session_state.latest_total_risk = total_risk
         risk_level, risk_emoji = get_risk_level(total_risk)
 
         # --------------------------------------------------------
@@ -375,6 +375,51 @@ def main():
             )
 
         st.session_state.run_analysis = False
+
+
+# --------------------------------------------------------
+# Facial Emotion Scan (Camera)
+# --------------------------------------------------------
+st.markdown("---")
+st.header("📷 Facial Emotion & Expression Scan (Camera)")
+st.caption("Optional facial-emotion check using your webcam to refine your wellness profile.")
+
+camera_image = st.camera_input(
+    "Align your face in the frame and capture a snapshot",
+    key="neurocare_camera_input"
+)
+
+if camera_image is not None:
+    with st.spinner("🧠 Analyzing facial expressions..."):
+        try:
+            face_result = analyze_face_image(camera_image.getvalue())
+
+            st.subheader("Facial Analysis Results")
+            st.write(f"**Dominant Emotion:** {face_result['dominant_emotion']}")
+            st.write(f"**Facial Stress Level:** {face_result['facial_stress_level']}")
+            st.write(f"**Facial Risk Score:** {face_result['face_risk']:.1%}")
+
+            if face_result.get("emotion_scores"):
+                st.markdown("**Emotion Distribution:**")
+                emo_df = pd.DataFrame({
+                    "Emotion": list(face_result["emotion_scores"].keys()),
+                    "Score": list(face_result["emotion_scores"].values())
+                }).set_index("Emotion")
+                st.bar_chart(emo_df, height=280, use_container_width=True)
+
+            base_risk = st.session_state.get("latest_total_risk")
+            if base_risk is not None:
+                combined_with_face = min(1.0, 0.7 * base_risk + 0.3 * face_result["face_risk"])
+                combined_level, combined_emoji = get_risk_level(combined_with_face)
+                st.info(
+                    f"**Updated Overall Risk (Text + Voice + Face):** "
+                    f"{combined_emoji} {combined_level} — {combined_with_face:.1%}"
+                )
+            else:
+                st.caption("Run a text/voice analysis first to combine facial results into the overall risk score.")
+        except Exception as e:
+            st.error(f"❌ Facial analysis error: {e}")
+            st.caption("Ensure DeepFace and its dependencies are installed, and that your face is clearly visible.")
 
     # --------------------------------------------------------
     # Trend Charts
