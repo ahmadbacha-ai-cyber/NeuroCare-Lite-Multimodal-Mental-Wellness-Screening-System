@@ -8,3 +8,9 @@ transformers==4.33.0
 scipy==1.11.2
 librosa==0.10.1
 soundfile==0.12.1
+opencv-python
+Pillow
+tensorflow==2.15.0
+keras==2.15.0
+tensorboard==2.15.0
+deepface
