@@ -1,379 +1,499 @@
 # voice_detector.py
-import numpy as np
-import librosa
-import soundfile as sf
+"""
+Advanced voice stress & energy analysis for NeuroCare Lite.
+
+This module:
+- Loads audio safely across platforms
+- Extracts multiple vocal biomarkers:
+    * RMS loudness (and dB)
+    * Pitch (mean + variability)
+    * Speech activity ratio (voiced vs silence)
+    * Approximate speech rate
+    * Zero-crossing rate (noisiness/tension)
+- Produces:
+    * stress_level (categorical)
+    * volume_level (categorical)
+    * speech_pace (categorical)
+    * voice_risk (0–1)
+    * features (rich dict used by the UI)
+
+It is compatible with the current app.py expectations:
+    analyze_voice(path) -> {
+        "stress_level": str,
+        "volume_level": str,
+        "speech_pace": str,
+        "voice_risk": float,
+        "features": {
+            "rms": float,
+            "pitch": float,
+            "speech_rate": float,
+            "pause_ratio": float,
+            ... (extra advanced features)
+        }
+    }
+"""
+
 import os
 import warnings
 import logging
+from typing import Tuple, Dict, Any
+
+import numpy as np
+import librosa
+import soundfile as sf
 
 warnings.filterwarnings("ignore")
 logger = logging.getLogger(__name__)
 
-# =============================================================================
-#   CROSS-PLATFORM AUDIO LOADER
-# =============================================================================
-def _safe_load_audio(audio_path, target_sr=22050):
-    """
-    Cross-platform safe audio loader.
-    1) Tries soundfile (fast, reliable for WAV/FLAC).
-    2) Falls back to librosa (handles MP3, etc.).
-    Also normalizes to mono and resamples to target_sr.
-    """
-    if not os.path.exists(audio_path):
-        logger.error(f"[VOICE] File not found: {audio_path}")
-        return None, None
+TARGET_SR = 22050
 
-    # Try soundfile first
+
+# =============================================================================
+#   CROSS-PLATFORM AUDIO LOADER (ROBUST + NORMALIZED)
+# =============================================================================
+def _safe_load_audio(audio_path: str, target_sr: int = TARGET_SR) -> Tuple[np.ndarray, int]:
+    """
+    Load audio in a robust, cross-platform way.
+
+    - Uses soundfile where possible (fast and precise)
+    - Falls back to librosa.load
+    - Normalizes sample rate and trims leading/trailing silence
+    """
+    y = None
+    sr = None
+
+    # Try with soundfile first
     try:
         y, sr = sf.read(audio_path)
-        if y.ndim > 1:  # stereo → mono
+        if y.ndim > 1:  # stereo -> mono
             y = y.mean(axis=1)
         y = y.astype(np.float32)
-
-        if sr != target_sr:
-            y = librosa.resample(y, orig_sr=sr, target_sr=target_sr)
-            sr = target_sr
-
-        # Trim leading / trailing silence
-        y, _ = librosa.effects.trim(y, top_db=30)
-        return y, sr
     except Exception as e:
         logger.info(f"[VOICE] soundfile read failed, falling back to librosa: {e}")
 
-    # Fallback: librosa.load
-    try:
-        y, sr = librosa.load(audio_path, sr=target_sr, mono=True)
-        # Trim silence
-        y, _ = librosa.effects.trim(y, top_db=30)
-        return y, sr
-    except Exception as e:
-        logger.error(f"[VOICE] librosa.load failed: {e}")
-        return None, None
-
-
-# =============================================================================
-#   COMPREHENSIVE VOICE FEATURE EXTRACTION
-# =============================================================================
-def _extract_voice_features(y, sr):
-    """
-    Extract comprehensive voice features:
-    - RMS Energy (volume/loudness)
-    - RMS variability
-    - Pitch (F0) using pYIN
-    - Speech rate / pause ratio
-    - Zero-crossing rate (voice quality)
-    - Spectral centroid (brightness / tension)
-    """
-
-    min_duration_sec = 0.4  # Require at least 0.4s of audio
-    if y is None or len(y) < sr * min_duration_sec:
-        return None  # Audio too short / invalid
-
-    features = {}
-
-    # 1) RMS Energy (Volume Level)
-    hop_length = 512
-    rms = librosa.feature.rms(y=y, hop_length=hop_length)[0]
-    features["rms"] = float(np.mean(rms))
-    features["rms_std"] = float(np.std(rms))
-    features["rms_max"] = float(np.max(rms))
-
-    # 2) Pitch Analysis (F0) using pYIN
-    try:
-        f0, voiced_flag, voiced_probs = librosa.pyin(
-            y,
-            sr=sr,
-            fmin=librosa.note_to_hz("C2"),
-            fmax=librosa.note_to_hz("C7")
-        )
-        f0_clean = f0[~np.isnan(f0)]
-
-        if len(f0_clean) > 0:
-            features["pitch"] = float(np.mean(f0_clean))
-            features["pitch_std"] = float(np.std(f0_clean))
-            features["pitch_min"] = float(np.min(f0_clean))
-            features["pitch_max"] = float(np.max(f0_clean))
-        else:
-            features["pitch"] = 0.0
-            features["pitch_std"] = 0.0
-            features["pitch_min"] = 0.0
-            features["pitch_max"] = 0.0
-
-        # Speech rate proxy: proportion of voiced frames
-        voiced_flag = voiced_flag.astype(bool)
-        speech_rate = float(np.mean(voiced_flag)) if len(voiced_flag) > 0 else 0.5
-        features["speech_rate"] = speech_rate
-        features["pause_ratio"] = float(1.0 - speech_rate)
-
-    except Exception as e:
-        logger.info(f"[VOICE] pYIN pitch extraction failed: {e}")
-        features["pitch"] = 0.0
-        features["pitch_std"] = 0.0
-        features["pitch_min"] = 0.0
-        features["pitch_max"] = 0.0
-        features["speech_rate"] = 0.5
-        features["pause_ratio"] = 0.5
-
-    # 3) Zero Crossing Rate (voice quality indicator)
-    zcr = librosa.feature.zero_crossing_rate(y, hop_length=hop_length)[0]
-    features["zcr"] = float(np.mean(zcr))
-
-    # 4) Spectral Features (brightness / tension proxy)
-    spectral_centroids = librosa.feature.spectral_centroid(y=y, sr=sr, hop_length=hop_length)[0]
-    features["spectral_centroid"] = float(np.mean(spectral_centroids))
-
-    return features
-
-
-# =============================================================================
-#   VOLUME LEVEL CLASSIFICATION
-# =============================================================================
-def _classify_volume(rms, rms_max):
-    """
-    Classifies volume level: Very Quiet, Quiet, Normal, Loud, Very Loud
-    Returns (label, risk_score).
-    """
-    # Use max RMS as primary indicator, mean as backup
-    if rms_max < 0.02:
-        return "Very Quiet", 0.25  # can indicate low energy / blunted affect
-    elif rms_max < 0.05:
-        return "Quiet", 0.20
-    elif rms_max < 0.12:
-        return "Normal", 0.15
-    elif rms_max < 0.20:
-        return "Loud", 0.25
-    else:
-        return "Very Loud", 0.35  # high arousal / tension
-
-
-# =============================================================================
-#   SPEECH PACE CLASSIFICATION
-# =============================================================================
-def _classify_speech_pace(speech_rate, pause_ratio):
-    """
-    Classifies speech pace: Very Slow, Slow, Normal, Fast, Very Fast
-    Uses speech_rate (proportion of voiced frames).
-    Returns (label, risk_score).
-    """
-    if speech_rate < 0.35:
-        return "Very Slow", 0.40   # strong depression / psychomotor retardation marker
-    elif speech_rate < 0.50:
-        return "Slow", 0.25
-    elif speech_rate < 0.75:
-        return "Normal", 0.15
-    elif speech_rate < 0.90:
-        return "Fast", 0.30        # anxiety / agitation
-    else:
-        return "Very Fast", 0.40   # strong anxiety / panic marker
-
-
-# =============================================================================
-#   PITCH-BASED STRESS DETECTION
-# =============================================================================
-def _analyze_pitch_stress(pitch, pitch_std, pitch_max):
-    """
-    Analyzes pitch characteristics for stress indicators:
-    - High pitch = vocal tension (anxiety/stress)
-    - High pitch variability = emotional instability
-    - Very low variability but elevated pitch = possible agitation
-    Returns risk_score (0.0–1.0).
-    """
-    stress_score = 0.0
-
-    # High average pitch
-    if pitch > 260:          # higher than typical adult average
-        stress_score += 0.25
-    elif pitch > 200:
-        stress_score += 0.15
-
-    # Pitch variability
-    if pitch_std > 60:
-        stress_score += 0.25   # high variability = emotional instability
-    elif 20 < pitch_std <= 60:
-        stress_score += 0.15
-    elif pitch_std < 10 and pitch > 0:
-        # extremely flat & non-zero: potential monotone sadness / blunting
-        stress_score += 0.10
-
-    # Very high peaks
-    if pitch_max > 400:
-        stress_score += 0.15
-
-    return min(stress_score, 1.0)
-
-
-# =============================================================================
-#   ENERGY VARIABILITY (EMOTIONAL LABILITY)
-# =============================================================================
-def _energy_variation_risk(rms_std):
-    """
-    Large swings in energy can be a sign of agitation / emotional arousal.
-    """
-    if rms_std < 0.01:
-        return 0.15
-    if rms_std < 0.03:
-        return 0.20
-    if rms_std < 0.06:
-        return 0.30
-    return 0.40
-
-
-# =============================================================================
-#   MAIN VOICE ANALYSIS FUNCTION
-# =============================================================================
-def analyze_voice(audio_path):
-    """
-    Comprehensive voice stress analyzer.
-    Detects:
-    - Volume level (quiet, normal, loud, very loud)
-    - Speech pace (very slow, slow, normal, fast, very fast)
-    - Pitch-based stress indicators
-    - Overall voice-based mental health risk
-
-    Returns: {
-        "stress_level": str,
-        "volume_level": str,
-        "speech_pace": str,
-        "voice_risk": float (0.0–1.0),
-        "features": dict
-    }
-    """
-    if not os.path.exists(audio_path):
-        return {
-            "stress_level": "No Audio File",
-            "volume_level": "N/A",
-            "speech_pace": "N/A",
-            "voice_risk": 0.0,
-            "features": {}
-        }
-
-    # Load audio safely
-    y, sr = _safe_load_audio(audio_path)
+    # Fallback to librosa
     if y is None or sr is None:
-        return {
-            "stress_level": "Audio Decode Error",
-            "volume_level": "N/A",
-            "speech_pace": "N/A",
-            "voice_risk": 0.0,
-            "features": {}
-        }
+        try:
+            y, sr = librosa.load(audio_path, sr=None, mono=True)
+            y = y.astype(np.float32)
+        except Exception as e:
+            logger.error(f"[VOICE] Failed to load audio file: {e}")
+            return np.array([], dtype=np.float32), 0
 
-    # Extract features
-    features = _extract_voice_features(y, sr)
-    if features is None:
-        return {
-            "stress_level": "Insufficient Audio",
-            "volume_level": "N/A",
-            "speech_pace": "N/A",
-            "voice_risk": 0.0,
-            "features": {}
-        }
+    # Resample to target sample rate
+    if sr != target_sr:
+        try:
+            y = librosa.resample(y, orig_sr=sr, target_sr=target_sr)
+            sr = target_sr
+        except Exception as e:
+            logger.info(f"[VOICE] Resample failed, keeping original sr={sr}: {e}")
 
-    # -------------------------------------------------------------------------
-    # MULTI-DIMENSIONAL VOICE ANALYSIS
-    # -------------------------------------------------------------------------
+    # Trim leading/trailing silence
+    try:
+        y, _ = librosa.effects.trim(y, top_db=40)
+    except Exception as e:
+        logger.info(f"[VOICE] Silence trimming failed: {e}")
 
-    # 1) Volume Analysis
-    volume_level, volume_risk = _classify_volume(
-        features["rms"],
-        features["rms_max"]
-    )
+    if y is None or len(y) < int(0.3 * sr):
+        # Too short / invalid
+        return np.array([], dtype=np.float32), 0
 
-    # 2) Speech Pace Analysis
-    speech_pace, pace_risk = _classify_speech_pace(
-        features["speech_rate"],
-        features["pause_ratio"]
-    )
+    return y, sr
 
-    # 3) Pitch-Based Stress Analysis
-    pitch_risk = _analyze_pitch_stress(
-        features["pitch"],
-        features["pitch_std"],
-        features["pitch_max"]
-    )
 
-    # 4) Energy Variability (emotional instability indicator)
-    rms_variation_risk = _energy_variation_risk(features["rms_std"])
+# =============================================================================
+#   CORE FEATURE EXTRACTORS
+# =============================================================================
+def _extract_basic_features(y: np.ndarray, sr: int) -> Dict[str, float]:
+    """
+    Extract low-level acoustic features:
+    - RMS energy
+    - Zero-crossing rate
+    - Spectral centroid (rough brightness)
+    - Duration (seconds)
+    """
+    duration_sec = len(y) / float(sr)
 
-    # -------------------------------------------------------------------------
-    #   SMART COMBINED VOICE RISK SCORE
-    # -------------------------------------------------------------------------
-    # Weight speech pace & pitch more than volume:
-    voice_risk = (
-        volume_risk       * 0.20 +
-        pace_risk         * 0.40 +   # speech rate = strongest indicator
-        pitch_risk        * 0.30 +
-        rms_variation_risk * 0.10
-    )
+    # RMS energy
+    rms_frame = librosa.feature.rms(y=y)[0]
+    rms = float(np.mean(rms_frame))
+    rms_std = float(np.std(rms_frame))
+    rms_max = float(np.max(rms_frame))
+    rms_db = 20.0 * np.log10(rms + 1e-9)
 
-    voice_risk = max(0.0, min(1.0, voice_risk))
+    # Zero Crossing Rate
+    zcr = librosa.feature.zero_crossing_rate(y)[0]
+    zcr_mean = float(np.mean(zcr))
 
-    # Overall qualitative stress level
-    if voice_risk >= 0.70:
-        stress_level = "Very High Stress"
-    elif voice_risk >= 0.50:
-        stress_level = "High Stress"
-    elif voice_risk >= 0.30:
-        stress_level = "Moderate Stress"
-    else:
-        stress_level = "Low Stress"
+    # Spectral centroid (rough brightness estimate)
+    try:
+        centroid = librosa.feature.spectral_centroid(y=y, sr=sr)[0]
+        spec_centroid_mean = float(np.mean(centroid))
+    except Exception:
+        spec_centroid_mean = 0.0
 
     return {
-        "stress_level": stress_level,
-        "volume_level": volume_level,
-        "speech_pace": speech_pace,
-        "voice_risk": round(float(voice_risk), 2),
-        "features": {
-            "rms": features["rms"],
-            "rms_std": features["rms_std"],
-            "rms_max": features["rms_max"],
-            "pitch": features["pitch"],
-            "pitch_std": features["pitch_std"],
-            "pitch_min": features["pitch_min"],
-            "pitch_max": features["pitch_max"],
-            "speech_rate": features["speech_rate"],
-            "pause_ratio": features["pause_ratio"],
-            "zcr": features["zcr"],
-            "spectral_centroid": features["spectral_centroid"],
-            "volume_risk": volume_risk,
-            "pace_risk": pace_risk,
-            "pitch_risk": pitch_risk,
-            "rms_variation_risk": rms_variation_risk,
+        "duration_sec": duration_sec,
+        "rms": rms,
+        "rms_std": rms_std,
+        "rms_max": rms_max,
+        "rms_db": rms_db,
+        "zcr_mean": zcr_mean,
+        "spec_centroid_mean": spec_centroid_mean,
+    }
+
+
+def _extract_pitch(y: np.ndarray, sr: int) -> Dict[str, float]:
+    """
+    Extract pitch curve using librosa.pyin (if possible).
+
+    Returns:
+        pitch_mean_hz, pitch_std_hz, voiced_ratio
+    """
+    try:
+        f0, voiced_flag, _ = librosa.pyin(
+            y,
+            fmin=librosa.note_to_hz("C2"),   # ~65 Hz
+            fmax=librosa.note_to_hz("C7"),   # ~2093 Hz
+            sr=sr,
+        )
+    except Exception as e:
+        logger.info(f"[VOICE] pYIN pitch extraction failed: {e}")
+        return {
+            "pitch_mean_hz": 0.0,
+            "pitch_std_hz": 0.0,
+            "voiced_ratio": 0.0,
         }
+
+    # Filter out unvoiced frames
+    if f0 is None or voiced_flag is None:
+        return {
+            "pitch_mean_hz": 0.0,
+            "pitch_std_hz": 0.0,
+            "voiced_ratio": 0.0,
+        }
+
+    f0 = np.array(f0)
+    voiced_flag = np.array(voiced_flag).astype(bool)
+    voiced_f0 = f0[voiced_flag]
+
+    if len(voiced_f0) == 0:
+        return {
+            "pitch_mean_hz": 0.0,
+            "pitch_std_hz": 0.0,
+            "voiced_ratio": 0.0,
+        }
+
+    pitch_mean_hz = float(np.nanmean(voiced_f0))
+    pitch_std_hz = float(np.nanstd(voiced_f0))
+    voiced_ratio = float(np.mean(voiced_flag.astype(float)))
+
+    return {
+        "pitch_mean_hz": pitch_mean_hz,
+        "pitch_std_hz": pitch_std_hz,
+        "voiced_ratio": voiced_ratio,
+    }
+
+
+def _estimate_speech_rate(y: np.ndarray, sr: int, rms: float) -> Dict[str, float]:
+    """
+    Approximate speech rate by counting 'speech-active' frames per second.
+
+    This is *not* word count; it's a proxy based on energy bursts:
+    - Higher speech_rate -> more syllable-like energy peaks.
+    """
+    # Frame-level RMS to detect speech segments
+    frame_rms = librosa.feature.rms(y=y, frame_length=1024, hop_length=512)[0]
+
+    # Speech threshold based on global RMS
+    thr = max(rms * 0.5, 1e-5)
+    speech_mask = frame_rms > thr
+
+    # Count contiguous segments as 'speech bursts'
+    speech_bursts = 0
+    in_speech = False
+    for val in speech_mask:
+        if val and not in_speech:
+            in_speech = True
+            speech_bursts += 1
+        elif not val:
+            in_speech = False
+
+    duration_sec = len(y) / float(sr)
+    if duration_sec <= 0:
+        speech_rate = 0.0
+    else:
+        speech_rate = speech_bursts / duration_sec  # bursts per second
+
+    voiced_ratio = float(np.mean(speech_mask.astype(float)))
+    pause_ratio = 1.0 - voiced_ratio
+
+    return {
+        "speech_rate": float(speech_rate),
+        "pause_ratio": float(pause_ratio),
+        "voiced_activity_ratio": voiced_ratio,
     }
 
 
 # =============================================================================
-#   LOCAL TEST MODE
+#   CLASSIFICATION HELPERS
 # =============================================================================
+def _classify_volume(rms_db: float) -> Tuple[str, float]:
+    """
+    Classify volume level based on RMS dB.
+    Also returns a risk contribution (0–1).
+    """
+    if rms_db < -40:
+        return "Very Quiet", 0.10
+    elif rms_db < -30:
+        return "Quiet", 0.05
+    elif rms_db < -15:
+        return "Normal", 0.0
+    elif rms_db < -5:
+        return "Loud", 0.15
+    else:
+        return "Very Loud", 0.25
+
+
+def _classify_speech_pace(speech_rate: float) -> Tuple[str, float]:
+    """
+    Classify speech pace (slow / normal / fast) using bursts per second.
+    Also returns a risk contribution.
+    """
+    if speech_rate < 0.8:
+        return "Very Slow", 0.15
+    elif speech_rate < 1.5:
+        return "Slow", 0.10
+    elif speech_rate < 3.0:
+        return "Normal", 0.0
+    elif speech_rate < 4.5:
+        return "Fast", 0.15
+    else:
+        return "Very Fast", 0.25
+
+
+def _analyze_pitch_stress(pitch_mean: float, pitch_std: float, voiced_ratio: float) -> float:
+    """
+    Compute a stress contribution from pitch characteristics.
+    - High pitch_std with moderate/high pitch → arousal/stress
+    - Extremely low pitch_mean + low std → flattening (could be depressive)
+    """
+    if voiced_ratio < 0.3:
+        # Not enough voiced data, low confidence
+        return 0.05
+
+    # Normalize pitch deviations
+    pitch_var = pitch_std / (pitch_mean + 1e-5)
+
+    risk = 0.0
+    # High variability suggests tension or emotional arousal
+    if pitch_var > 0.25:
+        risk += 0.20
+    elif pitch_var > 0.15:
+        risk += 0.10
+
+    # Very high pitch may indicate arousal
+    if pitch_mean > 260:  # Hz, roughly above high-speaking range
+        risk += 0.10
+
+    # Very low pitch + very low var might be 'flat' depressive tone
+    if pitch_mean < 100 and pitch_var < 0.08:
+        risk += 0.10
+
+    return float(min(1.0, max(0.0, risk)))
+
+
+def _energy_variation_risk(rms_std: float) -> float:
+    """
+    More dynamic RMS may reflect tension / emphasis.
+    Very low variation + low RMS -> flat, low-energy speech.
+    """
+    if rms_std < 0.005:
+        return 0.10  # very flat
+    elif rms_std < 0.02:
+        return 0.05
+    elif rms_std < 0.05:
+        return 0.10
+    else:
+        return 0.15
+
+
+def _determine_stress_label(total_risk: float, speech_rate: float, pitch_mean: float) -> str:
+    """
+    Map numeric voice_risk and patterns to a human-readable label.
+    Distinguish between 'activated' and 'fatigued' high stress.
+    """
+    if total_risk >= 0.75:
+        if speech_rate >= 3.0 or pitch_mean > 230:
+            return "High Stress (Activated)"
+        else:
+            return "High Stress (Fatigued/Flat)"
+    elif total_risk >= 0.50:
+        return "Moderate-to-High Stress"
+    elif total_risk >= 0.30:
+        return "Mild-to-Moderate Stress"
+    else:
+        return "Low Voice Stress"
+
+
+# =============================================================================
+#   MAIN PUBLIC FUNCTION
+# =============================================================================
+def analyze_voice(audio_path: str) -> Dict[str, Any]:
+    """
+    High-level entry point used by the Streamlit app.
+
+    Parameters
+    ----------
+    audio_path : str
+        Path to a recorded audio file (e.g., temp_recorded_audio.wav)
+
+    Returns
+    -------
+    dict:
+        {
+            "stress_level": str,
+            "volume_level": str,
+            "speech_pace": str,
+            "voice_risk": float (0–1),
+            "features": {
+                "rms": float,
+                "rms_db": float,
+                "pitch": float,
+                "pitch_std": float,
+                "speech_rate": float,
+                "pause_ratio": float,
+                "voiced_ratio": float,
+                "zcr_mean": float,
+                "duration_sec": float,
+                "quality_flag": str,
+                ...
+            }
+        }
+    """
+    if not audio_path or not os.path.exists(audio_path):
+        logger.error(f"[VOICE] Audio path not found: {audio_path}")
+        return {
+            "stress_level": "N/A",
+            "volume_level": "N/A",
+            "speech_pace": "N/A",
+            "voice_risk": 0.0,
+            "features": {}
+        }
+
+    y, sr = _safe_load_audio(audio_path)
+    if sr == 0 or y.size == 0:
+        logger.error("[VOICE] Unable to load or too-short audio.")
+        return {
+            "stress_level": "Low Voice Stress (Invalid/Short Audio)",
+            "volume_level": "Very Quiet",
+            "speech_pace": "N/A",
+            "voice_risk": 0.0,
+            "features": {
+                "duration_sec": 0.0,
+                "quality_flag": "invalid_or_too_short",
+            },
+        }
+
+    # 1) Basic features
+    basic = _extract_basic_features(y, sr)
+
+    # 2) Pitch features
+    pitch_feats = _extract_pitch(y, sr)
+
+    # 3) Speech activity / rate features
+    rate_feats = _estimate_speech_rate(y, sr, basic["rms"])
+
+    # Merge all features
+    feats = {**basic, **pitch_feats, **rate_feats}
+
+    # Volume classification (uses RMS dB)
+    volume_label, volume_risk = _classify_volume(feats["rms_db"])
+
+    # Speech pace classification
+    speech_pace_label, pace_risk = _classify_speech_pace(feats["speech_rate"])
+
+    # Pitch-based stress
+    pitch_risk = _analyze_pitch_stress(
+        feats["pitch_mean_hz"],
+        feats["pitch_std_hz"],
+        feats["voiced_activity_ratio"],
+    )
+
+    # RMS variation risk
+    rms_variation_risk = _energy_variation_risk(feats["rms_std"])
+
+    # Combine all into a single voice_risk
+    # You can tune these weights for your clinical profile
+    weights = {
+        "volume": 0.15,
+        "pace": 0.20,
+        "pitch": 0.35,
+        "energy_var": 0.30,
+    }
+
+    voice_risk = (
+        weights["volume"] * volume_risk +
+        weights["pace"] * pace_risk +
+        weights["pitch"] * pitch_risk +
+        weights["energy_var"] * rms_variation_risk
+    )
+
+    voice_risk = float(max(0.0, min(1.0, voice_risk)))
+
+    # Determine stress label based on combined picture
+    stress_label = _determine_stress_label(
+        voice_risk,
+        feats["speech_rate"],
+        feats["pitch_mean_hz"],
+    )
+
+    # -----------------------------------------------------------------
+    # Build features dict in a way compatible with your current app
+    # -----------------------------------------------------------------
+    features_out = {
+        # Core UI-visible features
+        "rms": float(feats["rms"]),
+        "pitch": float(feats["pitch_mean_hz"]),
+        "speech_rate": float(feats["speech_rate"]),
+        "pause_ratio": float(feats["pause_ratio"]),
+        # Extra advanced metrics for debugging / research
+        "rms_db": float(feats["rms_db"]),
+        "rms_std": float(feats["rms_std"]),
+        "rms_max": float(feats["rms_max"]),
+        "pitch_std": float(feats["pitch_std_hz"]),
+        "voiced_ratio": float(feats["voiced_activity_ratio"]),
+        "zcr_mean": float(feats["zcr_mean"]),
+        "duration_sec": float(feats["duration_sec"]),
+        "spec_centroid_mean": float(feats["spec_centroid_mean"]),
+        "quality_flag": (
+            "ok" if feats["duration_sec"] >= 2.0 and feats["rms_db"] > -45
+            else "caution_low_energy_or_short"
+        ),
+    }
+
+    result = {
+        "stress_level": stress_label,
+        "volume_level": volume_label,
+        "speech_pace": speech_pace_label,
+        "voice_risk": voice_risk,
+        "features": features_out,
+    }
+
+    return result
+
+
+# Optional: quick CLI test
 if __name__ == "__main__":
     test_file = "test.wav"
-
-    print("=" * 70)
-    print("VOICE STRESS ANALYSIS TEST")
-    print("=" * 70)
-
     if os.path.exists(test_file):
-        result = analyze_voice(test_file)
-
-        print(f"\n📊 ANALYSIS RESULTS:")
-        print(f"  Stress Level: {result['stress_level']}")
-        print(f"  Volume Level: {result['volume_level']}")
-        print(f"  Speech Pace: {result['speech_pace']}")
-        print(f"  Overall Voice Risk: {result['voice_risk']:.0%}")
-
-        print(f"\n🔬 TECHNICAL FEATURES:")
-        feats = result["features"]
-        print(f"  RMS Energy: {feats['rms']:.4f} (std: {feats['rms_std']:.4f}, max: {feats['rms_max']:.4f})")
-        print(f"  Pitch: {feats['pitch']:.1f} Hz (std: {feats['pitch_std']:.1f}, "
-              f"range: {feats['pitch_min']:.1f}-{feats['pitch_max']:.1f})")
-        print(f"  Speech Rate: {feats['speech_rate']:.2f}")
-        print(f"  Pause Ratio: {feats['pause_ratio']:.2f}")
-        print(f"  Zero Crossing Rate: {feats['zcr']:.4f}")
-        print(f"  Spectral Centroid: {feats['spectral_centroid']:.1f}")
-
-        print("\n" + "=" * 70)
+        print(f"Testing analyze_voice() on: {test_file}")
+        res = analyze_voice(test_file)
+        print("\n=== VOICE ANALYSIS RESULT ===")
+        for k in ["stress_level", "volume_level", "speech_pace", "voice_risk"]:
+            print(f"{k}: {res[k]}")
+        print("\n--- FEATURES ---")
+        for k, v in res["features"].items():
+            print(f"{k}: {v}")
     else:
-        print(f"\n❌ Test file '{test_file}' not found.")
-        print("Place a test audio file as 'test.wav' to run local tests.")
-        print("=" * 70)
+        print("Place a test file named 'test.wav' next to voice_detector.py to run this test.")
